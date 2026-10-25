@@ -1,0 +1,170 @@
+# 一加一代（oneplus-bacon）在 GitHub Actions 上生成 postmarketOS 镜像
+# 放到仓库的 .github/workflows/ 下即可。CI 只产出镜像文件，刷机仍需在本机用 fastboot。
+name: build-pmos-bacon
+
+on:
+  workflow_dispatch:
+    inputs:
+      ui:
+        description: "界面：console / xfce4 / sway / phosh"
+        type: string
+        default: console
+      extra_packages:
+        description: "额外预装包（逗号分隔，留空则不装）"
+        type: string
+        default: "htop,tmux,vim,openssh"
+      customize:
+        description: "注入 bacon 定制（首启动调整 / 固件 / motd）；关掉则生成纯净镜像"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 3 * * 1" # 每周一 03:00 UTC 重建一次（edge 是滚动的）
+
+env:
+  DEVICE: oneplus-bacon
+  UI: ${{ inputs.ui || 'console' }}
+  EXTRA: ${{ inputs.extra_packages || 'htop,tmux,vim,openssh' }}
+  CUSTOMIZE: ${{ inputs.customize == false && '0' || '1' }}
+  PMOS_APORTS: /home/runner/pmaports
+  # 默认用上游 pmaports，不需要 fork。等你真要长期维护自己的补丁时，
+  # 把这一行换成自己的 fork 即可（GitLab 或 GitHub 都行）：
+  #   https://gitlab.com/<你的账号>/pmaports.git
+  PMAPORTS_REPO: https://gitlab.com/postmarketOS/pmaports.git
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: 取仓库（bacon/ 下的定制脚本从这里来）
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          # 官方 runner 根分区只有 ~14G 可用，pmbootstrap 至少需要 10G+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3 python3-venv python3-pip git openssl zstd
+          # armv7 的 initramfs 生成需要在 chroot 里跑目标架构二进制，必须有 binfmt + qemu-user
+          sudo apt-get install -y -qq qemu-user-static binfmt-support \
+            || sudo apt-get install -y -qq qemu-user-static
+          ls /proc/sys/fs/binfmt_misc/ || true
+
+      - name: 安装 pmbootstrap
+        run: |
+          git clone --depth=1 https://gitlab.com/postmarketOS/pmbootstrap.git "$RUNNER_TEMP/pmbootstrap"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q -e "$RUNNER_TEMP/pmbootstrap"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          pmbootstrap --version
+
+      - name: 缓存 apk 包（大幅度缩短二次构建时间）
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.local/var/pmbootstrap/cache_apk_armv7
+          key: apk-${{ env.DEVICE }}-${{ env.UI }}-${{ github.run_id }}
+          restore-keys: |
+            apk-${{ env.DEVICE }}-${{ env.UI }}-
+            apk-${{ env.DEVICE }}-
+
+      - name: 准备 pmaports 并做设备定制
+        run: |
+          git clone --filter=blob:none "$PMAPORTS_REPO" "$PMOS_APORTS"
+          echo "pmaports 来源: $PMAPORTS_REPO"
+          git -C "$PMOS_APORTS" log -1 --oneline
+          # 先看看上游到底有没有这个键，免得我们改的是一行本来就存在的东西
+          grep -n 'create_initfs_extra' "$PMOS_APORTS"/device/*/device-"$DEVICE"/deviceinfo || true
+          if [ "$CUSTOMIZE" = "1" ]; then
+            chmod +x bacon/customize.sh
+            ./bacon/customize.sh "$PMOS_APORTS"
+          else
+            echo "已关闭定制，使用纯净 pmaports"
+          fi
+
+      - name: pmbootstrap init（非交互）
+        run: |
+          set -uo pipefail
+          # init 是问答式的：能传的用参数传，其余用空行吃掉（= 取默认值）
+          if ! yes '' | timeout 300 pmbootstrap -p "$PMOS_APORTS" init \
+                --device "$DEVICE" --ui "$UI" --details-to-stdout; then
+            echo "::warning::带参数 init 失败，回退到全默认 + config 覆盖"
+            yes '' | timeout 300 pmbootstrap -p "$PMOS_APORTS" init --details-to-stdout || true
+          fi
+
+          # 用 config 强制定稿关键项（如果某 key 在这个版本不存在会打警告，不影响其他项）
+          pmbootstrap -p "$PMOS_APORTS" config aports "$PMOS_APORTS" || true
+          pmbootstrap config device "$DEVICE"          || true
+          pmbootstrap config ui "$UI"                  || true
+          pmbootstrap config user user                 || true
+          pmbootstrap config hostname bacon            || true
+          pmbootstrap config timezone Asia/Shanghai    || true
+          pmbootstrap config extra_packages "$EXTRA"   || true
+          pmbootstrap config ssh_keys false            || true
+          pmbootstrap config sudo_timer true           || true
+
+          echo "==== 最终配置 ===="
+          echo "device = $(pmbootstrap config device)"
+          echo "ui     = $(pmbootstrap config ui)"
+          test "$(pmbootstrap config device)" = "$DEVICE"
+
+      - name: 生成镜像
+        run: |
+          set -o pipefail
+          # install 会交互式询问登录密码（这里喂固定的 147147，刷好后请立刻改掉）
+          printf '147147\n147147\n147147\n' | pmbootstrap -y install --details-to-stdout
+          pmbootstrap shutdown || true
+
+      - name: 导出镜像
+        run: |
+          pmbootstrap export
+          mkdir -p out
+          ls -l /tmp/postmarketOS-export/ || true
+          # 工作目录里很多文件是 root 所有，统一复制出来
+          sudo cp -L /tmp/postmarketOS-export/*.img out/ 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" out
+          ls -lh out
+          df -h /
+
+      - name: 注入 bacon 定制（首启动调整 / 固件 / motd）
+        if: env.CUSTOMIZE == '1'
+        run: |
+          chmod +x bacon/inject-tweaks.sh
+          IMG=$(ls out/*.img | grep -v '/boot\.img$' | head -n1)
+          [ -n "$IMG" ] || { echo "::error::没找到 rootfs 镜像"; exit 1; }
+          sudo ./bacon/inject-tweaks.sh "$IMG"
+
+      - name: 校验镜像（boot 分区只有 16MB，超了就是刷不进去）
+        run: |
+          BOOT=out/boot.img
+          test -f "$BOOT" || { echo "::error::没有生成 boot.img"; exit 1; }
+          SIZE=$(stat -c %s "$BOOT")
+          LIMIT=$((16 * 1024 * 1024))
+          echo "boot.img = $((SIZE / 1024)) KiB / 上限 16384 KiB"
+          file out/*.img
+          if [ "$SIZE" -ge "$LIMIT" ]; then
+            echo "::error::boot.img 超过 16MB 分区上限，刷入后无法开机。在 deviceinfo 里加 deviceinfo_create_initfs_extra=true 后重跑，或换更小的内核。"
+            exit 1
+          elif [ "$SIZE" -gt $((LIMIT * 95 / 100)) ]; then
+            echo "::warning::boot.img 已占用分区 95% 以上，后续内核更新会危险，建议精简 initramfs。"
+          fi
+          ( cd out && sha256sum *.img > SHA256SUMS.txt && cat SHA256SUMS.txt )
+
+      - name: 打印构建来源（出问题时方便回滚对比）
+        run: |
+          echo "pmbootstrap: $(pmbootstrap --version)"
+          git -C "$PMOS_APORTS" rev-parse HEAD || true
+          git -C "$PMOS_APORTS" log -1 --oneline || true
+          git -C "$PMOS_APORTS" diff -- device || true
+
+      - name: 上传镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmos-bacon-${{ env.UI }}-${{ github.run_number }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30

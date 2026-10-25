@@ -1,0 +1,11 @@
+# 构建产物
+out/
+*.img
+*.img.zst
+
+# 从原厂分区抽出来的闭源固件（博通二进制，不要提交到公开仓库）
+bacon/firmware/
+
+# 本地实验
+*.log
+.DS_Store
