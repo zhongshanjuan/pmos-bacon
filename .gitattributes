@@ -1,0 +1,6 @@
+# 这两个是 Linux 上执行的文件，强制 LF —— 否则 Windows 上编辑后变成 CRLF，
+# CI 里会报 "bad interpreter: /usr/bin/env bash^M"
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+* text=auto
