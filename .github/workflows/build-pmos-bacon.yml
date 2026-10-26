@@ -168,6 +168,9 @@ jobs:
           fi
 
           echo "==== 最终配置 ===="
+          # timezone 那题的默认值取的是宿主机时区（runner 是 Etc/UTC），不读配置，
+          # 所以 init 之后再定一次；失败也不致命（只是时区）。
+          pmbootstrap config timezone Asia/Shanghai || true
           for k in device kernel ui user hostname timezone aports extra_packages; do
             echo "  $k = $(pmbootstrap config "$k" || echo '<无此键>')"
           done
@@ -179,8 +182,10 @@ jobs:
       - name: 生成镜像
         run: |
           set -o pipefail
-          # --password 是给自动化用的明文占位密码（刷好后第一件事就是改掉）
-          pmbootstrap -y install --password 147147 --details-to-stdout
+          # 全局参数（-y / --details-to-stdout）必须写在子命令 install 之前，
+          # 否则 argparse 会报 unrecognized arguments（exit 2）。
+          # --password 是给自动化用的明文占位密码（刷好后第一件事就是改掉）。
+          pmbootstrap -y --details-to-stdout install --password 147147
           pmbootstrap shutdown || true
 
       - name: 导出镜像
