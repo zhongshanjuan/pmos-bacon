@@ -28,8 +28,11 @@ env:
   PMOS_APORTS: /home/runner/pmaports
   # 默认用上游 pmaports，不需要 fork。等你真要长期维护自己的补丁时，
   # 把这一行换成自己的 fork 即可（GitLab 或 GitHub 都行）：
-  #   https://gitlab.com/<你的账号>/pmaports.git
-  PMAPORTS_REPO: https://gitlab.com/postmarketOS/pmaports.git
+  #   https://gitlab.postmarketos.org/<你的账号>/pmaports.git
+  # 注意：2024-10 起 postmarketOS 已从 gitlab.com 整体迁到 gitlab.postmarketos.org，
+  # 旧地址只剩一个「请去新地址」的提示仓库，clone 下来必然跑不起来。
+  PMAPORTS_REPO: https://gitlab.postmarketos.org/postmarketOS/pmaports.git
+  PMBOOTSTRAP_REPO: https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
 
 jobs:
   build:
@@ -61,18 +64,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # gitlab.com 偶尔会抽风，重试三次
+          # gitlab 偶尔会抽风，重试三次
           ok=0
           for i in 1 2 3; do
             rm -rf "$RUNNER_TEMP/pmbootstrap"
-            if git clone --depth=1 https://gitlab.com/postmarketOS/pmbootstrap.git "$RUNNER_TEMP/pmbootstrap"; then
+            if git clone --depth=1 "$PMBOOTSTRAP_REPO" "$RUNNER_TEMP/pmbootstrap"; then
               ok=1; break
             fi
             echo "::warning::clone pmbootstrap 失败（第 $i 次），5 秒后重试"
             sleep 5
           done
-          if [ "$ok" != 1 ] || [ ! -d "$RUNNER_TEMP/pmbootstrap/pmb" ]; then
-            echo "::error::pmbootstrap 源码没拉下来，检查 gitlab.com 连通性"
+          # 旧地址（gitlab.com）clone 下来只剩一个迁移提示，pmb/ 目录不存在。
+          # 这里必须拦住，否则会一路跑到 install 才炸，看不出原因。
+          if [ "$ok" != 1 ] || [ ! -f "$RUNNER_TEMP/pmbootstrap/pmb/__init__.py" ]; then
+            echo "::error::pmbootstrap 源码不对（$PMBOOTSTRAP_REPO）。确认仓库是否已迁移，当前目录内容："
+            ls -la "$RUNNER_TEMP/pmbootstrap" || true
             exit 1
           fi
 
@@ -100,7 +106,15 @@ jobs:
 
       - name: 准备 pmaports 并做设备定制
         run: |
-          git clone --filter=blob:none "$PMAPORTS_REPO" "$PMOS_APORTS"
+          set -euo pipefail
+          ok=0
+          for i in 1 2 3; do
+            rm -rf "$PMOS_APORTS"
+            if git clone --filter=blob:none "$PMAPORTS_REPO" "$PMOS_APORTS"; then ok=1; break; fi
+            echo "::warning::clone pmaports 失败（第 $i 次），10 秒后重试"
+            sleep 10
+          done
+          [ "$ok" = 1 ] || { echo "::error::pmaports 拉不下来"; exit 1; }
           echo "pmaports 来源: $PMAPORTS_REPO"
           git -C "$PMOS_APORTS" log -1 --oneline
           # 先看看上游到底有没有这个键，免得我们改的是一行本来就存在的东西
@@ -112,37 +126,61 @@ jobs:
             echo "已关闭定制，使用纯净 pmaports"
           fi
 
-      - name: pmbootstrap init（非交互）
+      - name: 写配置并 init（非交互）
         run: |
           set -uo pipefail
-          # init 是问答式的：能传的用参数传，其余用空行吃掉（= 取默认值）
-          if ! yes '' | timeout 300 pmbootstrap -p "$PMOS_APORTS" init \
-                --device "$DEVICE" --ui "$UI" --details-to-stdout; then
-            echo "::warning::带参数 init 失败，回退到全默认 + config 覆盖"
-            yes '' | timeout 300 pmbootstrap -p "$PMOS_APORTS" init --details-to-stdout || true
+          CFG="$HOME/.config/pmbootstrap_v3.cfg"
+          mkdir -p "$(dirname "$CFG")"
+          [ -n "${EXTRA:-}" ] || EXTRA=none
+
+          # 新版 pmbootstrap 的 `init` 已经没有 --device/--ui 参数（只剩 --shallow-initial-clone），
+          # 设备是 vendor → codename 两级提问。好在每一题的默认值都取自现有配置，
+          # 所以先把目标值写进配置文件，再全部回车接受默认，比猜问题顺序靠谱得多。
+          # 键名取自 pmb/core/config.py 的 Config 类。
+          cat > "$CFG" <<EOF
+          [pmbootstrap]
+          aports = $PMOS_APORTS
+          device = $DEVICE
+          ui = $UI
+          user = user
+          hostname = bacon
+          timezone = Asia/Shanghai
+          extra_packages = $EXTRA
+          ssh_keys = false
+          sudo_timer = false
+          EOF
+          echo "==== 预置配置 $CFG ===="
+          cat "$CFG"
+
+          # channel 那题的默认值取自 pmaports 的 recommended，当前是 edge，
+          # 而 edge 对应的分支就是 main，与我们 clone 的分支一致，不会触发切分支。
+          #
+          # 注意用「答案文件 + 重定向」而不是 `yes '' | pmbootstrap`：
+          # 在 pipefail 下 yes 被 SIGPIPE 杀掉会让整条管道返回 141，
+          # 把一次成功的 init 误判成失败。
+          printf '\n%.0s' $(seq 1 300) > "$RUNNER_TEMP/answers.txt"
+          if ! timeout 900 pmbootstrap --details-to-stdout init \
+                < "$RUNNER_TEMP/answers.txt"; then
+            echo "::error::pmbootstrap init 失败。版本与配置如下："
+            pmbootstrap --version || true
+            cat "$CFG" || true
+            exit 1
           fi
 
-          # 用 config 强制定稿关键项（如果某 key 在这个版本不存在会打警告，不影响其他项）
-          pmbootstrap -p "$PMOS_APORTS" config aports "$PMOS_APORTS" || true
-          pmbootstrap config device "$DEVICE"          || true
-          pmbootstrap config ui "$UI"                  || true
-          pmbootstrap config user user                 || true
-          pmbootstrap config hostname bacon            || true
-          pmbootstrap config timezone Asia/Shanghai    || true
-          pmbootstrap config extra_packages "$EXTRA"   || true
-          pmbootstrap config ssh_keys false            || true
-          pmbootstrap config sudo_timer true           || true
-
           echo "==== 最终配置 ===="
-          echo "device = $(pmbootstrap config device)"
-          echo "ui     = $(pmbootstrap config ui)"
-          test "$(pmbootstrap config device)" = "$DEVICE"
+          for k in device kernel ui user hostname timezone aports extra_packages; do
+            echo "  $k = $(pmbootstrap config "$k" || echo '<无此键>')"
+          done
+          test "$(pmbootstrap config device)" = "$DEVICE" \
+            || { echo "::error::device 没定下来，仍是 $(pmbootstrap config device)"; exit 1; }
+          test "$(pmbootstrap config ui)" = "$UI" \
+            || { echo "::error::ui 没定下来"; exit 1; }
 
       - name: 生成镜像
         run: |
           set -o pipefail
-          # install 会交互式询问登录密码（这里喂固定的 147147，刷好后请立刻改掉）
-          printf '147147\n147147\n147147\n' | pmbootstrap -y install --details-to-stdout
+          # --password 是给自动化用的明文占位密码（刷好后第一件事就是改掉）
+          pmbootstrap -y install --password 147147 --details-to-stdout
           pmbootstrap shutdown || true
 
       - name: 导出镜像

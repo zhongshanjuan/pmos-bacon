@@ -23,8 +23,13 @@ trap 'rm -rf "$TMP"' EXIT
 #    如果加上这行反而变大，把它注释掉再跑一次即可，不要盲信。
 # ---------------------------------------------------------------------------
 if grep -q '^deviceinfo_create_initfs_extra=' "$DEVDIR/deviceinfo"; then
-    sed -i 's|^deviceinfo_create_initfs_extra=.*|deviceinfo_create_initfs_extra="true"|' \
-        "$DEVDIR/deviceinfo"
+    if grep -q '^deviceinfo_create_initfs_extra="true"' "$DEVDIR/deviceinfo"; then
+        echo "== 上游 deviceinfo 已有 create_initfs_extra=\"true\"，无需改动（这是上游修的，不是我们加的）"
+    else
+        echo "== deviceinfo 里已有该键但值不是 true，改成 true"
+        sed -i 's|^deviceinfo_create_initfs_extra=.*|deviceinfo_create_initfs_extra="true"|' \
+            "$DEVDIR/deviceinfo"
+    fi
 else
     printf '\ndeviceinfo_create_initfs_extra="true"\n' >> "$DEVDIR/deviceinfo"
 fi
