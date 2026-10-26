@@ -29,25 +29,62 @@ trap cleanup EXIT
 LOOP=$(losetup -fP --show "$IMG")
 echo "== 镜像 $IMG -> $LOOP"
 
+# 列出候选块设备。
+# 注意：pmbootstrap 的分区布局固定是 p1=/boot、p2=/，两个分区都是 ext2/ext4，
+# 所以「第一个 ext 分区」= boot 分区，不是我们要写的 rootfs。必须按标签/内容判断。
+candidates() {
+    local p
+    for p in "${LOOP}"p*; do
+        [ -b "$p" ] && printf '%s\n' "$p"
+    done
+    return 0
+}
+
 find_root() {
-    local p type
+    local p type label size best="" bestsize=0 tmp
     # 情况 A：镜像本身就是裸文件系统（没有分区表）
     type=$(blkid -o value -s TYPE "$LOOP" 2>/dev/null || true)
-    if [ -n "$type" ]; then
-        case "$type" in
-            ext4|ext3|ext2|f2fs|btrfs) echo "$LOOP"; return 0 ;;
-        esac
-    fi
-    # 情况 B：有分区表，挑出 rootfs 所在分区
-    for p in "${LOOP}"p*; do
-        [ -b "$p" ] || continue
-        type=$(blkid -o value -s TYPE "$p" 2>/dev/null || true)
-        echo "   分区 $p  fstype=${type:-未知}" >&2
-        case "$type" in
-            ext4|ext3|ext2|f2fs|btrfs) echo "$p"; return 0 ;;
-        esac
+    case "$type" in
+        ext4|ext3|ext2|f2fs|btrfs) printf '%s\n' "$LOOP"; return 0 ;;
+    esac
+
+    # 情况 B-1：按标签挑。pmOS 的 root 分区标签默认就是 pmOS_root。
+    for p in $(candidates); do
+        label=$(blkid -o value -s LABEL "$p" 2>/dev/null || true)
+        [ "$label" = "pmOS_root" ] || continue
+        printf '%s\n' "$p"; return 0
     done
-    return 1
+
+    # 情况 B-2：标签不可靠时靠内容判断 —— 只读挂一下，看里面是不是真的 postmarketOS 根。
+    tmp=$(mktemp -d)
+    for p in $(candidates); do
+        type=$(blkid -o value -s TYPE "$p" 2>/dev/null || true)
+        label=$(blkid -o value -s LABEL "$p" 2>/dev/null || true)
+        echo "   分区 $p  fstype=${type:-未知} label=${label:-无}" >&2
+        case "$type" in
+            ext4|ext3|ext2|f2fs|btrfs) ;;
+            *) continue ;;
+        esac
+        if mount -o ro "$p" "$tmp" 2>/dev/null; then
+            if grep -qi '^ID=postmarketos' "$tmp/etc/os-release" 2>/dev/null \
+               || { [ -d "$tmp/usr/lib/apk" ] && [ -f "$tmp/sbin/init" ]; }; then
+                umount "$tmp" 2>/dev/null || true
+                rmdir "$tmp" 2>/dev/null || true
+                printf '%s\n' "$p"; return 0
+            fi
+            umount "$tmp" 2>/dev/null || true
+        fi
+    done
+    rmdir "$tmp" 2>/dev/null || true
+
+    # 情况 B-3：兜底取最大的分区（root 一定远大于 boot）
+    for p in $(candidates); do
+        size=$(blockdev --getsize64 "$p" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$bestsize" ]; then best="$p"; bestsize="$size"; fi
+    done
+    [ -n "$best" ] || return 1
+    echo "   ::warning::靠标签和内容都没认出来，退化为最大分区 $best" >&2
+    printf '%s\n' "$best"
 }
 
 ROOT=""
@@ -66,6 +103,17 @@ fi
 
 mount -o rw "$ROOT" "$MNT"
 echo "== 挂载 $ROOT -> $MNT"
+
+# 最后一道保险：万一挂到了 /boot，宁可直接失败并报错，
+# 也不要产出一个「构建成功、定制却没生效」的镜像去浪费时间刷机。
+if ! grep -qi '^ID=postmarketos' "$MNT/etc/os-release" 2>/dev/null && [ ! -d "$MNT/usr/lib/apk" ]; then
+    echo "ERROR: $ROOT 不像是 postmarketOS 根分区（没有 /etc/os-release，也没有 /usr/lib/apk）" >&2
+    echo "       下面列出它的顶层内容，便于判断挂错到了哪个分区：" >&2
+    ls -la "$MNT" >&2 || true
+    findmnt -no SOURCE,FSTYPE,LABEL,SIZE "$MNT" >&2 || true
+    exit 1
+fi
+echo "   已确认这是 postmarketOS 根分区"
 
 # usr-merge 兼容：新镜像里 /lib 是指向 /usr/lib 的符号链接
 if [ -d "$MNT/usr/lib" ]; then
