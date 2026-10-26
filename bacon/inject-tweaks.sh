@@ -15,11 +15,57 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: 需要 root 才能 loop mount" >&2; exit 1; }
 
 MNT=$(mktemp -d)
-cleanup() { umount "$MNT" 2>/dev/null || true; rmdir "$MNT" 2>/dev/null || true; }
+LOOP=""
+cleanup() {
+    umount "$MNT" 2>/dev/null || true
+    if [ -n "$LOOP" ]; then losetup -d "$LOOP" 2>/dev/null || true; fi
+    rmdir "$MNT" 2>/dev/null || true
+}
 trap cleanup EXIT
 
-mount -o loop,rw "$IMG" "$MNT"
-echo "== 挂载 $IMG -> $MNT"
+# pmbootstrap 导出的 <device>.img 是「整盘镜像」：开头是 msdos 分区表，
+# 直接 mount -o loop 会报 "wrong fs type, bad option, bad superblock"。
+# 正确做法是 losetup -P 让内核解析分区，再挂 root 分区。
+LOOP=$(losetup -fP --show "$IMG")
+echo "== 镜像 $IMG -> $LOOP"
+
+find_root() {
+    local p type
+    # 情况 A：镜像本身就是裸文件系统（没有分区表）
+    type=$(blkid -o value -s TYPE "$LOOP" 2>/dev/null || true)
+    if [ -n "$type" ]; then
+        case "$type" in
+            ext4|ext3|ext2|f2fs|btrfs) echo "$LOOP"; return 0 ;;
+        esac
+    fi
+    # 情况 B：有分区表，挑出 rootfs 所在分区
+    for p in "${LOOP}"p*; do
+        [ -b "$p" ] || continue
+        type=$(blkid -o value -s TYPE "$p" 2>/dev/null || true)
+        echo "   分区 $p  fstype=${type:-未知}" >&2
+        case "$type" in
+            ext4|ext3|ext2|f2fs|btrfs) echo "$p"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+ROOT=""
+for _ in 1 2 3 4 5; do
+    partx -u "$LOOP" 2>/dev/null || true
+    ROOT=$(find_root) && break
+    ROOT=""
+    sleep 2
+done
+if [ -z "$ROOT" ]; then
+    echo "ERROR: 在 $IMG 里找不到可挂载的 rootfs 分区" >&2
+    lsblk -f "$LOOP" 2>/dev/null || true
+    blkid "$LOOP" 2>/dev/null || true
+    exit 1
+fi
+
+mount -o rw "$ROOT" "$MNT"
+echo "== 挂载 $ROOT -> $MNT"
 
 # usr-merge 兼容：新镜像里 /lib 是指向 /usr/lib 的符号链接
 if [ -d "$MNT/usr/lib" ]; then
@@ -108,6 +154,7 @@ EOF
 
 sync
 umount "$MNT"
+losetup -d "$LOOP"
 rmdir "$MNT"
 trap - EXIT
 echo "== 注入完成: $IMG"

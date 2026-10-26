@@ -203,8 +203,12 @@ jobs:
         if: env.CUSTOMIZE == '1'
         run: |
           chmod +x bacon/inject-tweaks.sh
-          IMG=$(ls out/*.img | grep -v '/boot\.img$' | head -n1)
+          # out/ 里有 boot.img / lk2nd.img / <codename>.img 三个文件，
+          # 按体积降序取最大的那个才是 rootfs（1.2G 级别），别用字母序。
+          ls -lS out/*.img
+          IMG=$(ls -S out/*.img | grep -v '/boot\.img$' | grep -v '/lk2nd\.img$' | head -n1)
           [ -n "$IMG" ] || { echo "::error::没找到 rootfs 镜像"; exit 1; }
+          echo "rootfs 镜像: $IMG"
           sudo ./bacon/inject-tweaks.sh "$IMG"
 
       - name: 校验镜像（boot 分区只有 16MB，超了就是刷不进去）
