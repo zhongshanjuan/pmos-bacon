@@ -17,8 +17,16 @@ on:
         description: "注入 bacon 定制（首启动调整 / 固件 / motd）；关掉则生成纯净镜像"
         type: boolean
         default: true
+      publish_release:
+        description: "把镜像发到 Release（可直接下载，不用登录、不用解压 artifact）"
+        type: boolean
+        default: true
   schedule:
     - cron: "0 3 * * 1" # 每周一 03:00 UTC 重建一次（edge 是滚动的）
+
+# 发布 Release 需要写权限（GITHUB_TOKEN 默认只有读）
+permissions:
+  contents: write
 
 env:
   DEVICE: oneplus-bacon
@@ -241,3 +249,48 @@ jobs:
           path: out/
           if-no-files-found: error
           retention-days: 30
+
+      # 发布到 Release：文件本来就在 runner 上，走 GitHub 内网，
+      # 比在本地下载再上传快得多，而且下载时不用登录、不用解压 artifact。
+      - name: 发布到 Release
+        if: ${{ env.CUSTOMIZE == '1' && (github.event_name == 'schedule' || inputs.publish_release) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="bacon-${UI}-$(date -u +%Y%m%d-%H%M)"
+          # 用户拿到的是一个 zip（含 boot.img / lk2nd.img / rootfs / sha256），
+          # 外加单独一个 boot.img 方便只换内核。
+          ( cd out && zip -9 -q pmos-bacon-images.zip boot.img lk2nd.img oneplus-bacon.img SHA256SUMS.txt )
+          ls -lh out/
+
+          cat > /tmp/notes.md <<EOF
+          postmarketOS edge — OnePlus One (oneplus-bacon)
+
+          设备类别：testing（能开机、WiFi/蓝牙/短信/移动数据可用；通话/相机/GPS/加速度计/OTG/FDE 不可用）
+
+          文件说明
+          - \`pmos-bacon-images.zip\`：完整镜像，解压得到 boot.img、lk2nd.img、oneplus-bacon.img、SHA256SUMS.txt
+          - \`boot.img\`：单独的内核 + initramfs（本次 ${UI} 界面，$(stat -c %s out/boot.img | awk '{printf "%.1f", $1/1024/1024}') MiB / 分区上限 16 MiB）
+
+          刷机（Windows / Linux 均可，需先解锁 bootloader）
+          \`\`\`
+          fastboot oem unlock          # 首次，会清空数据
+          fastboot flash boot boot.img
+          fastboot flash userdata oneplus-bacon.img   # 必须刷到 userdata，不要刷 system（只有 1.4G）
+          fastboot reboot
+          \`\`\`
+          刷完默认登录：用户 \`user\`，密码 \`147147\`，请立刻改掉。
+
+          如果 \`fastboot flash\` 报 \`Unknown chunk type\`，先把 \`lk2nd.img\` 刷到 boot 分区，
+          开机时按住音量下进 lk2nd 菜单，再刷 rootfs。
+
+          构建信息：run #${GITHUB_RUN_NUMBER}，界面 ${UI}，pmaports \`$(git -C "$PMOS_APORTS" rev-parse --short HEAD 2>/dev/null || echo unknown)\`
+          SHA256 见 \`SHA256SUMS.txt\`。
+          EOF
+
+          gh release create "$TAG" \
+            --title "postmarketOS edge / bacon / ${UI} / run #${GITHUB_RUN_NUMBER}" \
+            --notes-file /tmp/notes.md \
+            out/boot.img out/pmos-bacon-images.zip
+          echo "::notice::已发布 https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
