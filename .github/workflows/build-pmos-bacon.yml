@@ -56,11 +56,37 @@ jobs:
           ls /proc/sys/fs/binfmt_misc/ || true
 
       - name: 安装 pmbootstrap
+        env:
+          VENV: /home/runner/pmb-venv
         run: |
-          git clone --depth=1 https://gitlab.com/postmarketOS/pmbootstrap.git "$RUNNER_TEMP/pmbootstrap"
-          python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install -q -e "$RUNNER_TEMP/pmbootstrap"
-          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+
+          # gitlab.com 偶尔会抽风，重试三次
+          ok=0
+          for i in 1 2 3; do
+            rm -rf "$RUNNER_TEMP/pmbootstrap"
+            if git clone --depth=1 https://gitlab.com/postmarketOS/pmbootstrap.git "$RUNNER_TEMP/pmbootstrap"; then
+              ok=1; break
+            fi
+            echo "::warning::clone pmbootstrap 失败（第 $i 次），5 秒后重试"
+            sleep 5
+          done
+          if [ "$ok" != 1 ] || [ ! -d "$RUNNER_TEMP/pmbootstrap/pmb" ]; then
+            echo "::error::pmbootstrap 源码没拉下来，检查 gitlab.com 连通性"
+            exit 1
+          fi
+
+          python3 -m venv "$VENV"
+          test -x "$VENV/bin/pip" || { echo "::error::venv 里没有 pip（缺 python3-venv？）"; exit 1; }
+          "$VENV/bin/pip" install -q --upgrade pip setuptools wheel
+          "$VENV/bin/pip" install -q -e "$RUNNER_TEMP/pmbootstrap"
+          test -x "$VENV/bin/pmbootstrap" || { echo "::error::pmbootstrap 入口脚本没装上"; exit 1; }
+
+          # 关键：GITHUB_PATH 只对「后续 step」生效，当前 step 必须用绝对路径。
+          # 之前的失败就是这里：echo 到 GITHUB_PATH 之后紧接着裸调 pmbootstrap，得到 127（command not found）。
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          export PATH="$VENV/bin:$PATH"
+          echo "PATH = $PATH"
           pmbootstrap --version
 
       - name: 缓存 apk 包（大幅度缩短二次构建时间）
